@@ -72,3 +72,7 @@ parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
 parser.add_argument('--root_log',type=str, default='log')
 parser.add_argument('--root_model', type=str, default='checkpoint')
+parser.add_argument('--save_dir', type=str, default='./saved/')
+parser.add_argument('--project', type=str, default='test')
+parser.add_argument('--runid', type=str, default='test')
+parser.add_argument('--entity', type=str, default='aaai-23')

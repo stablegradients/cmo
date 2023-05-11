@@ -9,6 +9,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
+from models.resnet_cifar import Classifier
 from tensorboardX import SummaryWriter
 from imbalance_data.imbalance_cifar import IMBALANCECIFAR100
 from losses import LDAMLoss, BalancedSoftmaxLoss
@@ -18,6 +19,8 @@ from util.util import *
 from util.autoaug import CIFAR10Policy, Cutout
 import util.moco_loader as moco_loader
 
+from util.util import get_metrics
+import wandb
 
 best_acc1 = 0
 
@@ -63,19 +66,24 @@ def main_worker(gpu, ngpus_per_node, args):
     num_classes = args.num_classes
     use_norm = True if args.loss_type == 'LDAM' else False
     model = models.__dict__[args.arch](num_classes=num_classes, use_norm=use_norm)
+    classifier = Classifier(64, num_classes)
     # print(model)
 
     if args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        classifier = classifier.cuda(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
         model = torch.nn.DataParallel(model).cuda()
+        classifier = torch.nn.DataParallel(classifier).cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD([{"params": model.parameters()},
+                                 {"params": classifier.parameters()}], args.lr,
+                                 momentum=args.momentum,
+                                 weight_decay=args.weight_decay)
 
+    wandb.init(project=args.project, id=args.runid, entity=args.entity)
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -228,27 +236,32 @@ def main_worker(gpu, ngpus_per_node, args):
             return
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args, log_training,
+        train(train_loader, model, classifier, criterion, optimizer, epoch, args, log_training,
               tf_writer, weighted_train_loader)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
-
+        classes = [str(i) for i in range(num_classes)]
+        acc1, metrics = validate(val_loader, model, classifier, criterion, epoch, args, log_testing, tf_writer, classes=classes)
+        print("Logging Wandb")
+        print(metrics)
+        wandb.log(metrics)
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
         tf_writer.add_scalar('acc/test_top1_best', best_acc1, epoch)
         output_best = 'Best Prec@1: %.3f\n' % (best_acc1)
-        print(output_best)
         log_testing.write(output_best + '\n')
         log_testing.flush()
-
-        save_checkpoint(args, {
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_acc1': best_acc1,
-        }, is_best, epoch + 1)
+        
+        model_dir = '%s/%s/ckpt.pth.tar' % (args.root_model, args.store_name)
+        
+        save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict_model': model.state_dict(),
+                    'state_dict_classifier': classifier.state_dict(),
+                    'best_acc1': best_acc1,
+                }, is_best, args.save_dir)
 
     end_time = time.time()
 
@@ -264,7 +277,7 @@ def hms_string(sec_elapsed):
     return "{}:{:>02}:{:>05.2f}".format(h, m, s)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args, log,
+def train(train_loader, model, classifier, criterion, optimizer, epoch, args, log,
               tf_writer, weighted_train_loader=None):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -307,11 +320,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log,
             # adjust lambda to exactly match pixel ratio
             lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
             # compute output
-            output = model(input)
+            output = classifier(model(input))
             loss = criterion(output, target) * lam + criterion(output, target2) * (1. - lam)
 
         else:
-            output = model(input)
+            output = classifier(model(input))
             loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -382,7 +395,7 @@ def rand_bbox_withcenter(size, lam, cx, cy):
     return bbx1, bby1, bbx2, bby2
 
 
-def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None, flag='val'):
+def validate(val_loader, model, classifier, criterion, epoch, args, log=None, tf_writer=None, flag='val', classes=[""]):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -390,8 +403,10 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
 
     # switch to evaluate mode
     model.eval()
+    classifier.eval()
     all_preds = []
     all_targets = []
+    preds, labels = [], []
     with torch.no_grad():
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
@@ -399,8 +414,10 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(input)
+            output = classifier(model(input))
             loss = criterion(output, target)
+            labels.append(target.cpu().detach().numpy())
+            preds.append(torch.argmax(output, dim=1).cpu().detach().numpy())
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -425,6 +442,9 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
                     i, len(val_loader), batch_time=batch_time, loss=losses,
                     top1=top1, top5=top5))
                 print(output)
+        preds, labels = (np.concatenate(preds, axis=0),\
+                         np.concatenate(labels, axis=0))
+        metrics = get_metrics(preds, labels, classes, 'test/')
         cf = confusion_matrix(all_targets, all_preds).astype(float)
         cls_cnt = cf.sum(axis=1)
         cls_hit = np.diag(cf)
@@ -454,7 +474,7 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
         tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
         tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i): x for i, x in enumerate(cls_acc)}, epoch)
 
-    return top1.avg
+    return top1.avg, metrics
 
 
 def adjust_learning_rate(optimizer, epoch, args):
